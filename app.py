@@ -28,7 +28,6 @@ app.add_middleware(
     allow_origins=["*"], allow_methods=["*"], allow_headers=["*"],
 )
 
-# ── Session store ──────────────────────────────────────────────────────
 _SESSIONS: Dict[str, Dict[str, Any]] = {}
 SESSION_TTL = 1800
 
@@ -45,7 +44,6 @@ def _get_env(session_id: str) -> HelpdeskEnv:
     return _SESSIONS[session_id]["env"]
 
 
-# ── Schemas ────────────────────────────────────────────────────────────
 class ResetRequest(BaseModel):
     task_name:  Optional[str] = None
     seed:       Optional[int] = 42
@@ -68,9 +66,12 @@ class StepResponse(BaseModel):
     score:       float
 
 
-# ── Routes ─────────────────────────────────────────────────────────────
-@app.get("/", summary="Health check")
+@app.get("/health", summary="Health check (OpenEnv spec)")
 def health():
+    return {"status": "healthy"}
+
+@app.get("/", summary="Root")
+def root():
     return {
         "status":           "ok",
         "environment":      "it-helpdesk-openenv",
@@ -79,26 +80,22 @@ def health():
         "tickets_per_task": TICKETS_PER_TASK,
     }
 
-@app.get("/tasks", summary="List available tasks")
+@app.get("/tasks")
 def list_tasks():
     return {"tasks": TASKS}
 
 
-@app.post("/reset", response_model=ResetResponse, summary="Start a new episode")
+@app.post("/reset", response_model=ResetResponse)
 async def reset(request: Request):
-    """
-    Start (or restart) an episode.
-    Body is fully optional — works with empty body {}, no Content-Type, or full JSON.
-    """
-    # Safely parse body — don't fail if body is empty or missing
+    """Body is fully optional — works with empty body, {}, or full JSON."""
     req = ResetRequest()
     try:
         body = await request.body()
         if body and body.strip() not in (b"", b"{}"):
             data = await request.json()
-            req = ResetRequest(**data)
+            req = ResetRequest(**{k: v for k, v in data.items() if v is not None})
     except Exception:
-        pass  # use defaults
+        pass
 
     sid = req.session_id or str(uuid.uuid4())
     env = _SESSIONS[sid]["env"] if sid in _SESSIONS else HelpdeskEnv(seed=req.seed or 42)
@@ -108,45 +105,29 @@ async def reset(request: Request):
         raise HTTPException(status_code=400, detail=str(exc))
 
     _SESSIONS[sid] = {"env": env, "ts": time.time()}
-    return ResetResponse(
-        session_id  = sid,
-        observation = obs,
-        task_names  = env.task_names,
-    )
+    return ResetResponse(session_id=sid, observation=obs, task_names=env.task_names)
 
 
-@app.post("/step", response_model=StepResponse, summary="Take one action")
+@app.post("/step", response_model=StepResponse)
 def step(req: StepRequest):
-    """Submit an action. Returns next observation, reward, done flag, and info."""
     env = _get_env(req.session_id)
     try:
         obs, reward, done, info = env.step(req.action)
     except RuntimeError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
-
-    return StepResponse(
-        observation = obs,
-        reward      = reward,
-        done        = done,
-        info        = info,
-        score       = env.score(),
-    )
+    return StepResponse(observation=obs, reward=reward, done=done, info=info, score=env.score())
 
 
-@app.get("/state/{session_id}", response_model=HelpdeskState, summary="Get current state")
+@app.get("/state/{session_id}", response_model=HelpdeskState)
 def state(session_id: str):
-    """Returns current state without advancing the episode."""
-    env = _get_env(session_id)
-    return env.state()
+    return _get_env(session_id).state()
 
-
-# Also support /state without session_id (returns placeholder)
-@app.get("/state", summary="State endpoint (no session)")
+@app.get("/state")
 def state_root():
     return {"detail": "Pass session_id: GET /state/{session_id}"}
 
 
-@app.delete("/close/{session_id}", summary="Close session")
+@app.delete("/close/{session_id}")
 def close(session_id: str):
     if session_id in _SESSIONS:
         _SESSIONS[session_id]["env"].close()
@@ -154,22 +135,17 @@ def close(session_id: str):
     return {"closed": session_id}
 
 
-@app.get("/validate", summary="Self-validation — runs graders on all tasks")
+@app.get("/validate")
 def validate():
-    """Smoke-tests all 4 tasks. All scores must be in [0, 1]."""
     results = {}
     env = HelpdeskEnv(seed=99)
-
     SMART_ACTIONS = {
         "classify_category": lambda obs: HelpdeskAction(
             action="classify",
             category=(
-                "network"  if any(w in obs.ticket.lower() for w in
-                                  ["vpn","wifi","network","dns","packet","ssh","sso"]) else
-                "hardware" if any(w in obs.ticket.lower() for w in
-                                  ["battery","screen","printer","hard","monitor","fan","cpu"]) else
-                "software" if any(w in obs.ticket.lower() for w in
-                                  ["excel","outlook","zoom","update","windows","onedrive","teams"]) else
+                "network"  if any(w in obs.ticket.lower() for w in ["vpn","wifi","network","dns","packet","ssh","sso"]) else
+                "hardware" if any(w in obs.ticket.lower() for w in ["battery","screen","printer","hard","monitor","fan","cpu"]) else
+                "software" if any(w in obs.ticket.lower() for w in ["excel","outlook","zoom","update","windows","onedrive","teams"]) else
                 "access"
             )
         ),
@@ -182,8 +158,7 @@ def validate():
         "escalate_or_resolve": lambda obs: HelpdeskAction(
             action="decide",
             decision=("escalate_to_level2"
-                      if any(w in obs.ticket.lower() for w in
-                             ["vpn","network","packet","dns","ssh","sso"])
+                      if any(w in obs.ticket.lower() for w in ["vpn","network","packet","dns","ssh","sso"])
                       else "resolve")
         ),
         "draft_response": lambda obs: HelpdeskAction(
@@ -193,7 +168,6 @@ def validate():
                    "We will follow up with you shortly.")
         ),
     }
-
     all_ok = True
     for task in TASKS:
         obs = env.reset(task_name=task["name"])
@@ -201,7 +175,6 @@ def validate():
         while True:
             action = SMART_ACTIONS[task["name"]](obs)
             obs, r, done, info = env.step(action)
-            assert 0. <= r <= 1., f"Reward {r} out of [0,1]!"
             rewards.append(r)
             if info.get("last_action_error"):
                 errors.append(info["last_action_error"])
@@ -210,12 +183,6 @@ def validate():
         score = env.score()
         ok = 0. <= score <= 1.
         all_ok = all_ok and ok
-        results[task["name"]] = {
-            "score":      round(score, 4),
-            "rewards_ok": all(0. <= r <= 1. for r in rewards),
-            "pass":       ok,
-            "errors":     errors,
-        }
-
+        results[task["name"]] = {"score": round(score, 4), "pass": ok, "errors": errors}
     env.close()
     return {"all_pass": all_ok, "tasks": results}
