@@ -1,14 +1,13 @@
 """
 IT Helpdesk OpenEnv — HuggingFace Space FastAPI Server
-========================================================
-Exposes the environment as a REST API for automated evaluation.
+OpenEnv RFC 002 compliant.
 """
 
 import uuid
 import time
 from typing import Any, Dict, Optional
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
@@ -19,9 +18,9 @@ from environment import (
 )
 
 app = FastAPI(
-    title       = "IT Helpdesk OpenEnv",
-    description = "Real-world IT support ticket triage environment for LLM evaluation.",
-    version     = "1.0.0",
+    title="IT Helpdesk OpenEnv",
+    description="Real-world IT support ticket triage environment for LLM evaluation.",
+    version="1.0.0",
 )
 
 app.add_middleware(
@@ -29,14 +28,13 @@ app.add_middleware(
     allow_origins=["*"], allow_methods=["*"], allow_headers=["*"],
 )
 
-# ── Session store ─────────────────────────────────────────────────────
+# ── Session store ──────────────────────────────────────────────────────
 _SESSIONS: Dict[str, Dict[str, Any]] = {}
-SESSION_TTL = 1800  # 30 min
+SESSION_TTL = 1800
 
 def _gc():
     now = time.time()
-    expired = [sid for sid, s in _SESSIONS.items() if now - s["ts"] > SESSION_TTL]
-    for sid in expired:
+    for sid in [s for s, v in list(_SESSIONS.items()) if now - v["ts"] > SESSION_TTL]:
         del _SESSIONS[sid]
 
 def _get_env(session_id: str) -> HelpdeskEnv:
@@ -47,11 +45,11 @@ def _get_env(session_id: str) -> HelpdeskEnv:
     return _SESSIONS[session_id]["env"]
 
 
-# ── Request / Response schemas ─────────────────────────────────────────
+# ── Schemas ────────────────────────────────────────────────────────────
 class ResetRequest(BaseModel):
     task_name:  Optional[str] = None
     seed:       Optional[int] = 42
-    session_id: Optional[str] = None   # pass to reuse session
+    session_id: Optional[str] = None
 
 class StepRequest(BaseModel):
     session_id: str
@@ -70,14 +68,14 @@ class StepResponse(BaseModel):
     score:       float
 
 
-# ── Routes ────────────────────────────────────────────────────────────
+# ── Routes ─────────────────────────────────────────────────────────────
 @app.get("/", summary="Health check")
 def health():
     return {
-        "status":      "ok",
-        "environment": "it-helpdesk-openenv",
-        "version":     "1.0.0",
-        "tasks":       [t["name"] for t in TASKS],
+        "status":           "ok",
+        "environment":      "it-helpdesk-openenv",
+        "version":          "1.0.0",
+        "tasks":            [t["name"] for t in TASKS],
         "tickets_per_task": TICKETS_PER_TASK,
     }
 
@@ -87,11 +85,21 @@ def list_tasks():
 
 
 @app.post("/reset", response_model=ResetResponse, summary="Start a new episode")
-def reset(req: ResetRequest):
+async def reset(request: Request):
     """
     Start (or restart) an episode.
-    Returns a session_id — pass this to /step and /state.
+    Body is fully optional — works with empty body {}, no Content-Type, or full JSON.
     """
+    # Safely parse body — don't fail if body is empty or missing
+    req = ResetRequest()
+    try:
+        body = await request.body()
+        if body and body.strip() not in (b"", b"{}"):
+            data = await request.json()
+            req = ResetRequest(**data)
+    except Exception:
+        pass  # use defaults
+
     sid = req.session_id or str(uuid.uuid4())
     env = _SESSIONS[sid]["env"] if sid in _SESSIONS else HelpdeskEnv(seed=req.seed or 42)
     try:
@@ -109,10 +117,7 @@ def reset(req: ResetRequest):
 
 @app.post("/step", response_model=StepResponse, summary="Take one action")
 def step(req: StepRequest):
-    """
-    Submit an action. Returns next observation, reward, done flag, and info.
-    Reward is always in [0.0, 1.0].
-    """
+    """Submit an action. Returns next observation, reward, done flag, and info."""
     env = _get_env(req.session_id)
     try:
         obs, reward, done, info = env.step(req.action)
@@ -135,6 +140,12 @@ def state(session_id: str):
     return env.state()
 
 
+# Also support /state without session_id (returns placeholder)
+@app.get("/state", summary="State endpoint (no session)")
+def state_root():
+    return {"detail": "Pass session_id: GET /state/{session_id}"}
+
+
 @app.delete("/close/{session_id}", summary="Close session")
 def close(session_id: str):
     if session_id in _SESSIONS:
@@ -145,10 +156,7 @@ def close(session_id: str):
 
 @app.get("/validate", summary="Self-validation — runs graders on all tasks")
 def validate():
-    """
-    Smoke-tests all 4 tasks with keyword-guided actions.
-    All scores must be in [0, 1]. Returns pass/fail per task.
-    """
+    """Smoke-tests all 4 tasks. All scores must be in [0, 1]."""
     results = {}
     env = HelpdeskEnv(seed=99)
 
@@ -157,9 +165,9 @@ def validate():
             action="classify",
             category=(
                 "network"  if any(w in obs.ticket.lower() for w in
-                                  ["vpn","wifi","network","dns","packet","ssh","sso","drive"]) else
+                                  ["vpn","wifi","network","dns","packet","ssh","sso"]) else
                 "hardware" if any(w in obs.ticket.lower() for w in
-                                  ["battery","screen","printer","drive","hard","monitor","fan","cpu"]) else
+                                  ["battery","screen","printer","hard","monitor","fan","cpu"]) else
                 "software" if any(w in obs.ticket.lower() for w in
                                   ["excel","outlook","zoom","update","windows","onedrive","teams"]) else
                 "access"
@@ -197,15 +205,16 @@ def validate():
             rewards.append(r)
             if info.get("last_action_error"):
                 errors.append(info["last_action_error"])
-            if done: break
+            if done:
+                break
         score = env.score()
-        ok    = 0. <= score <= 1.
+        ok = 0. <= score <= 1.
         all_ok = all_ok and ok
         results[task["name"]] = {
-            "score":       round(score, 4),
-            "rewards_ok":  all(0. <= r <= 1. for r in rewards),
-            "pass":        ok,
-            "errors":      errors,
+            "score":      round(score, 4),
+            "rewards_ok": all(0. <= r <= 1. for r in rewards),
+            "pass":       ok,
+            "errors":     errors,
         }
 
     env.close()
