@@ -1,0 +1,147 @@
+name: it-helpdesk-openenv
+version: "1.0.0"
+author: "Team GOAT"
+description: >
+  IT Helpdesk ticket triage environment for LLM evaluation.
+  Agents must classify tickets, suggest troubleshooting steps,
+  make escalation decisions, and draft professional user responses.
+  All graders are deterministic; rewards always in [0.0, 1.0].
+
+tasks:
+  - id: classify_category
+    name: "Classify IT Ticket Category"
+    description: >
+      Given an IT support ticket description, classify it into
+      exactly one of: network, hardware, software, or access.
+    difficulty: easy
+    max_steps: 5
+    reward_threshold: 0.8
+    action_type: classify
+
+  - id: suggest_steps
+    name: "Suggest Troubleshooting Steps"
+    description: >
+      Given an IT support ticket, provide 2-4 concrete troubleshooting
+      steps that an IT technician should follow.
+    difficulty: medium
+    max_steps: 5
+    reward_threshold: 0.6
+    action_type: suggest_steps
+
+  - id: escalate_or_resolve
+    name: "Escalation Decision"
+    description: >
+      Decide whether to resolve the ticket internally (resolve) or
+      escalate to level-2 specialist support (escalate_to_level2).
+      Network issues always require escalation.
+    difficulty: medium
+    max_steps: 5
+    reward_threshold: 0.8
+    action_type: decide
+
+  - id: draft_response
+    name: "Draft User Response"
+    description: >
+      Write a professional, empathetic response to the user (15-60 words).
+      Must acknowledge the issue, summarise next steps, and set expectations.
+    difficulty: hard
+    max_steps: 5
+    reward_threshold: 0.5
+    action_type: draft
+
+observation_space:
+  type: object
+  description: "Typed Pydantic model: HelpdeskObservation"
+  properties:
+    ticket:
+      type: string
+      description: "IT support ticket description"
+    task_name:
+      type: string
+      enum: [classify_category, suggest_steps, escalate_or_resolve, draft_response]
+    task_id:
+      type: integer
+      minimum: 0
+      maximum: 3
+    step:
+      type: integer
+      description: "Current step index (0-indexed)"
+    total_steps:
+      type: integer
+      description: "Total steps per episode (5)"
+    hint:
+      type: string
+      description: "JSON schema the agent must follow for its response"
+
+action_space:
+  type: object
+  description: "Typed Pydantic model: HelpdeskAction"
+  properties:
+    action:
+      type: string
+      enum: [classify, suggest_steps, decide, draft]
+    category:
+      type: string
+      nullable: true
+      enum: [network, hardware, software, access]
+      description: "Required for action=classify"
+    steps:
+      type: array
+      nullable: true
+      items:
+        type: string
+      description: "Required for action=suggest_steps (2-4 items)"
+    decision:
+      type: string
+      nullable: true
+      enum: [resolve, escalate_to_level2]
+      description: "Required for action=decide"
+    draft:
+      type: string
+      nullable: true
+      description: "Required for action=draft (15-60 words)"
+
+reward:
+  type: float
+  range: [0.0, 1.0]
+  description: >
+    Partial credit at every step based on action quality.
+    classify: exact_match=1.0, adjacent=0.3, wrong=0.0
+    suggest_steps: keyword coverage + per-step quality (Jaccard)
+    decide: exact=1.0, wrong_for_network=0.0, soft_partial=0.2
+    draft: 50% keyword_overlap + 20% length + 30% empathy_keywords
+
+endpoints:
+  reset:
+    method: POST
+    path: /reset
+    description: "Start new episode. Returns session_id + initial observation."
+  step:
+    method: POST
+    path: /step
+    description: "Take action. Returns obs, reward (float), done (bool), info."
+  state:
+    method: GET
+    path: /state/{session_id}
+    description: "Get current state without advancing episode."
+  close:
+    method: DELETE
+    path: /close/{session_id}
+    description: "Terminate session and free resources."
+  validate:
+    method: GET
+    path: /validate
+    description: "Self-test all graders; verifies rewards in [0,1]."
+
+runtime:
+  python: ">=3.10"
+  dependencies:
+    - fastapi>=0.111.0
+    - uvicorn>=0.29.0
+    - pydantic>=2.0.0
+    - openai>=1.30.0
+  hardware:
+    cpu: 2
+    memory_gb: 8
+    gpu_required: false
+  max_inference_time_minutes: 20
